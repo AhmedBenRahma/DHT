@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chord DHT Simulator</title>
+<style>
+  :root { --bg:#fafafa; --fg:#1f2328; --muted:#6b7280; --card:#fff; --line:#d0d7de;
+          --accent:#2563eb; --ok:#16a34a; --bad:#dc2626; --hot:#f59e0b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1115; --fg:#e6e8eb; --muted:#9aa4b2; --card:#171a21; --line:#2c323c;
+            --accent:#60a5fa; --ok:#4ade80; --bad:#f87171; --hot:#fbbf24; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.45 system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:14px 20px; border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:2px 0 0; color:var(--muted); }
+  main { display:grid; grid-template-columns:340px 1fr; gap:16px; padding:16px; max-width:1300px; margin:0 auto; }
+  @media (max-width:900px){ main { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:12px; margin-bottom:12px; }
+  .card h2 { margin:0 0 8px; font-size:13px; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); }
+  label { display:block; font-size:12px; color:var(--muted); margin:6px 0 2px; }
+  input, select, button { font:inherit; padding:6px 8px; border-radius:6px; border:1px solid var(--line);
+                          background:var(--bg); color:var(--fg); width:100%; }
+  button { cursor:pointer; background:var(--accent); color:#fff; border:0; margin-top:8px; }
+  button.secondary { background:transparent; color:var(--fg); border:1px solid var(--line); }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+  svg { width:100%; max-width:560px; height:auto; display:block; margin:0 auto; }
+  table { border-collapse:collapse; width:100%; font-variant-numeric:tabular-nums; }
+  th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:500; font-size:12px; }
+  #log { height:220px; overflow:auto; font:12px/1.5 ui-monospace,monospace; white-space:pre-wrap; }
+  .ok { color:var(--ok); } .bad { color:var(--bad); } .hot { color:var(--hot); }
+  .node { cursor:pointer; }
+  .hint { color:var(--muted); font-size:12px; margin-top:6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Chord DHT Simulator</h1>
+  <p>Ring overlay with m-bit SHA-1 identifiers, finger tables, lookup, join/leave and concurrent churn.</p>
+</header>
+<main>
+  <section>
+    <div class="card">
+      <h2>1. Create the ring</h2>
+      <div class="row">
+        <div><label>m (bits, 1–16)</label><input id="m" type="number" min="1" max="16" value="4"></div>
+        <div><label>Initial peers (names or #id)</label><input id="init" value="A B C D"></div>
+      </div>
+      <button onclick="ui.create()">Create ring</button>
+      <div class="hint">Use <b>#5</b> to force an identifier (paper example: m=3, <b>#0 #1 #3</b>).</div>
+    </div>
+    <div class="card">
+      <h2>2. Join a peer</h2>
+      <div class="row">
+        <div><label>New peer (blank = auto)</label><input id="jname"></div>
+        <div><label>Entry peer</label><select id="jboot"></select></div>
+      </div>
+      <button onclick="ui.join()">Join</button>
+    </div>
+    <div class="card">
+      <h2>3. Lookup</h2>
+      <div class="row">
+        <div><label>Start peer</label><select id="lfrom"></select></div>
+        <div><label>Key (text or #id)</label><input id="lkey" value="hello"></div>
+      </div>
+      <button onclick="ui.lookup()">Lookup</button>
+    </div>
+    <div class="card">
+      <h2>4. Leave</h2>
+      <label>Peer leaving</label><select id="lvnode"></select>
+      <button onclick="ui.leave()">Leave</button>
+    </div>
+    <div class="card">
+      <h2>5. p peers in concurrence</h2>
+      <div class="row">
+        <div><label>p joins</label><input id="pj" type="number" min="0" value="3"></div>
+        <div><label>q leaves</label><input id="pl" type="number" min="0" value="2"></div>
+      </div>
+      <button onclick="ui.concurrent()">Run concurrent churn</button>
+      <div class="hint">Peers arrive/leave at the same time, then stabilize / notify / fix_fingers rounds run until the ring is consistent.</div>
+    </div>
+    <div class="card">
+      <h2>Data &amp; checks</h2>
+      <div class="row">
+        <div><label>Key</label><input id="ikey" value="book"></div>
+        <div><label>Value</label><input id="ival" value="42"></div>
+      </div>
+      <button class="secondary" onclick="ui.insert()">Insert key/value</button>
+      <button class="secondary" onclick="ui.verify()">Verify consistency</button>
+    </div>
+  </section>
+  <section>
+    <div class="card"><h2>Ring</h2><svg id="svg" viewBox="0 0 560 560"></svg>
+      <div class="hint">Click a peer to see its finger table. Squares are stored keys. Orange arrows show the last lookup path.</div></div>
+    <div class="card"><h2>Finger table</h2><div id="ft">Select a peer.</div></div>
+    <div class="card"><h2>All peers</h2><div id="all"></div></div>
+    <div class="card"><h2>Log</h2><div id="log"></div></div>
+  </section>
+</main>
+
+<script>
+// CORE-START
+"use strict";
+function sha1hex(msg){
+  const bytes=new TextEncoder().encode(msg), l=bytes.length;
+  const buf=new Uint8Array(((l+9+63)>>6)<<6); buf.set(bytes); buf[l]=0x80;
+  const dv=new DataView(buf.buffer);
+  dv.setUint32(buf.length-4,(l*8)>>>0); dv.setUint32(buf.length-8,Math.floor(l*8/4294967296));
+  let h0=0x67452301,h1=0xEFCDAB89,h2=0x98BADCFE,h3=0x10325476,h4=0xC3D2E1F0;
+  const w=new Uint32Array(80);
+  for(let off=0;off<buf.length;off+=64){
+    for(let i=0;i<16;i++) w[i]=dv.getUint32(off+i*4);
+    for(let i=16;i<80;i++){const x=w[i-3]^w[i-8]^w[i-14]^w[i-16]; w[i]=(x<<1)|(x>>>31);}
+    let a=h0,b=h1,c=h2,d=h3,e=h4;
+    for(let i=0;i<80;i++){
+      let f,k;
+      if(i<20){f=(b&c)|(~b&d);k=0x5A827999;}
+      else if(i<40){f=b^c^d;k=0x6ED9EBA1;}
+      else if(i<60){f=(b&c)|(b&d)|(c&d);k=0x8F1BBCDC;}
+      else{f=b^c^d;k=0xCA62C1D6;}
+      const t=((((a<<5)|(a>>>27))+f+e+k+w[i])>>>0);
+      e=d;d=c;c=(b<<30)|(b>>>2);b=a;a=t;
+    }
+    h0=(h0+a)>>>0;h1=(h1+b)>>>0;h2=(h2+c)>>>0;h3=(h3+d)>>>0;h4=(h4+e)>>>0;
+  }
+  return [h0,h1,h2,h3,h4].map(x=>x.toString(16).padStart(8,"0")).join("");
+}
+const sha1m=(text,m)=>parseInt(sha1hex(text).slice(-8),16)%(2**m);
+const mod=(a,n)=>((a%n)+n)%n;
+function inOO(x,a,b){ if(a<b) return a<x&&x<b; if(a>b) return x>a||x<b; return x!==a; }
+function inOC(x,a,b){ if(a===b) return true; if(a<b) return a<x&&x<=b; return x>a||x<=b; }
+function inCO(x,a,b){ if(a===b) return false; if(a<b) return a<=x&&x<b; return x>=a||x<b; }
+const shuffle=a=>{for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;};
+
+class Node {
+  constructor(ring,id,name){
+    this.ring=ring; this.id=id; this.name=name; this.m=ring.m;
+    this.start=Array.from({length:ring.m},(_,i)=>(id+2**i)%ring.M);
+    this.finger=Array(ring.m).fill(this);
+    this.pred=null; this.succList=[]; this.keys=new Map(); this.alive=true;
+  }
+  get succ(){ return this.finger[0]; }
+  liveSucc(){
+    const s=this.finger[0]; if(s.alive) return s;
+    for(const z of this.succList) if(z.alive){ this.finger[0]=z; return z; }
+    let best=null,bd=null;
+    for(const f of this.finger) if(f.alive&&f!==this){
+      const d=mod(f.id-this.id,this.ring.M); if(bd===null||d<bd){best=f;bd=d;}
+    }
+    if(best){ this.finger[0]=best; return best; }
+    return this;
+  }
+  cpfIndex(key){
+    for(let i=this.m-1;i>=0;i--){ const f=this.finger[i]; if(f.alive&&inOO(f.id,this.id,key)) return i; }
+    return -1;
+  }
+  findPred(key,trace){
+    let n=this, hops=0; const limit=64+4*this.m+2*this.ring.nodes.size;
+    for(;;){
+      const s=n.liveSucc();
+      if(inOC(key,n.id,s.id)) return n;
+      const idx=n.cpfIndex(key); if(idx<0) return n;
+      const nxt=n.finger[idx];
+      if(trace) trace.push({from:n,idx,to:nxt});
+      n=nxt; if(++hops>limit) throw new Error("lookup failed");
+    }
+  }
+  findSucc(key,trace){ return this.findPred(key,trace).liveSucc(); }
+
+  // ---- sequential mode (paper Fig. 6)
+  joinSeq(boot){
+    if(!boot){ this.finger=Array(this.m).fill(this); this.pred=this; return; }
+    this.initFingerTable(boot); this.updateOthers(); this.takeKeys();
+  }
+  initFingerTable(boot){
+    this.finger[0]=boot.findSucc(this.start[0]);
+    const succ=this.finger[0];
+    this.pred=succ.pred; succ.pred=this; this.pred.finger[0]=this;
+    for(let i=0;i<this.m-1;i++){
+      if(inCO(this.start[i+1],this.id,this.finger[i].id)) this.finger[i+1]=this.finger[i];
+      else this.finger[i+1]=boot.findSucc(this.start[i+1]);
+    }
+  }
+  updateOthers(){
+    for(let i=0;i<this.m;i++){
+      const ident=mod(this.id-2**i,this.ring.M);
+      let p=this.findPred(ident);
+      if(p.succ.id===ident&&p.succ!==this) p=p.succ;
+      if(p!==this) p.updateFingerTable(this,i);
+    }
+  }
+  updateFingerTable(s,i){
+    let p=this;
+    while(p!==s&&inCO(s.id,p.start[i],p.finger[i].id)){ p.finger[i]=s; p=p.pred; }
+  }
+  takeKeys(){
+    const succ=this.succ; if(succ===this) return;
+    for(const [k,v] of [...succ.keys]) if(!inOC(k,this.id,succ.id)){ succ.keys.delete(k); this.keys.set(k,v); }
+  }
+  leaveSeq(){
+    const succ=this.succ, pred=this.pred;
+    for(const [k,v] of this.keys) succ.keys.set(k,v);
+    this.keys=new Map();
+    for(let i=0;i<this.m;i++){
+      const ident=mod(this.id-2**i,this.ring.M);
+      let p=this.findPred(ident);
+      if(p.succ.id===ident&&p.succ!==this) p=p.succ;
+      if(p===this) p=this.pred;
+      while(p!==this&&p.finger[i]===this){ p.finger[i]=succ; p=p.pred; }
+    }
+    pred.finger[0]=succ; succ.pred=pred; this.alive=false;
+  }
+
+  // ---- concurrent mode (paper Fig. 7)
+  joinConc(boot){ this.pred=null; const s=boot.findSucc(this.id); this.finger=Array(this.m).fill(s); }
+  stabilize(){
+    let s=this.liveSucc(); const x=s.pred;
+    if(x&&x.alive&&inOO(x.id,this.id,s.id)){ s=x; this.finger[0]=x; }
+    s.notify(this);
+    this.succList=[s,...s.succList.filter(z=>z!==this&&z!==s)].slice(0,this.ring.r);
+  }
+  notify(n){
+    const p=this.pred; let changed=false;
+    if(!p||!p.alive||inOO(n.id,p.id,this.id)){ changed=p!==n; this.pred=n; }
+    if(changed&&n!==this) this.handKeys(n);
+  }
+  handKeys(pred){
+    for(const [k,v] of [...this.keys]) if(!inOC(k,pred.id,this.id)){ this.keys.delete(k); pred.keys.set(k,v); }
+  }
+  checkPred(){ if(this.pred&&!this.pred.alive) this.pred=null; }
+  fixFingers(){
+    for(let i=0;i<this.m;i++){ try{ this.finger[i]=this.findSucc(this.start[i]); }catch(e){} }
+  }
+  heal(){
+    const others=[...this.ring.nodes.values()].filter(n=>n.alive&&n!==this); if(!others.length) return;
+    const s=others[Math.floor(Math.random()*others.length)].findSucc((this.id+1)%this.ring.M);
+    const cur=this.liveSucc();
+    if(s.alive&&s!==this&&(cur===this||inOO(s.id,this.id,cur.id))) this.finger[0]=s;
+  }
+  round(heal){
+    try{ this.checkPred(); if(heal||this.liveSucc()===this) this.heal(); this.stabilize(); this.fixFingers(); }catch(e){}
+  }
+  leaveConc(){
+    const keys=this.keys; this.keys=new Map(); this.alive=false;
+    for(const c of [this.finger[0],...this.succList]) if(c!==this&&c.alive){ for(const [k,v] of keys) c.keys.set(k,v); return; }
+    for(const o of this.ring.nodes.values()) if(o.alive&&o!==this){ for(const [k,v] of keys) o.keys.set(k,v); return; }
+  }
+}
+
+class Ring {
+  constructor(m){
+    if(!(m>=1&&m<=30)) throw new Error("m must be between 1 and 30");
+    this.m=m; this.M=2**m; this.nodes=new Map(); this.counter=0; this.r=Math.max(3,Math.min(m,8));
+  }
+  makeId(name){
+    if(name.startsWith("#")){ const v=parseInt(name.slice(1),10);
+      if(!(v>=0&&v<this.M)) throw new Error(`identifier must be in [0, ${this.M-1}]`); return v; }
+    return sha1m(name,this.m);
+  }
+  keyId(label){ return this.makeId(label); }
+  newNode(name){
+    const id=this.makeId(name);
+    if(this.nodes.has(id)) throw new Error(`collision: id ${id} already used by '${this.nodes.get(id).name}'`);
+    const n=new Node(this,id,name); this.nodes.set(id,n); return n;
+  }
+  freeName(){
+    if(this.nodes.size>=this.M) throw new Error("ring is full");
+    for(;;){ const nm="peer"+(++this.counter); if(!this.nodes.has(this.makeId(nm))) return nm; }
+  }
+  sorted(){ return [...this.nodes.keys()].sort((a,b)=>a-b).map(i=>this.nodes.get(i)); }
+  refreshSuccLists(){
+    for(const n of this.nodes.values()){ const l=[]; let c=n;
+      for(let i=0;i<this.r;i++){ c=c.succ; if(c===n) break; l.push(c); } n.succList=l; }
+  }
+  join(name,boot){
+    const n=this.newNode(name);
+    try{
+      if(this.nodes.size===1) n.joinSeq(null);
+      else n.joinSeq(boot&&boot!==n?boot:[...this.nodes.values()].find(x=>x!==n));
+    }catch(e){ this.nodes.delete(n.id); throw e; }
+    this.refreshSuccLists(); return n;
+  }
+  leave(node){
+    if(this.nodes.size===1){ node.alive=false; this.nodes.delete(node.id); return; }
+    node.leaveSeq(); this.nodes.delete(node.id); this.refreshSuccLists();
+  }
+  insert(from,label,value){
+    const kid=this.keyId(label), owner=from.findSucc(kid);
+    owner.keys.set(kid,{label,value}); return {kid,owner};
+  }
+  redistribute(){
+    let moved=0;
+    for(const n of [...this.nodes.values()]) for(const k of [...n.keys.keys()]){
+      let o; try{ o=n.findSucc(k); }catch(e){ continue; }
+      if(o!==n&&n.keys.has(k)){ o.keys.set(k,n.keys.get(k)); n.keys.delete(k); moved++; }
+    }
+    return moved;
+  }
+  verify(checkKeys=true){
+    const nodes=this.sorted(), n=nodes.length, errs=[];
+    if(!n) return {ok:true,errs};
+    const truth=x=>{ for(const nd of nodes) if(nd.id>=x) return nd; return nodes[0]; };
+    nodes.forEach((nd,i)=>{
+      if(nd.succ!==nodes[(i+1)%n]) errs.push(`successor of ${nd.id}`);
+      if(nd.pred!==nodes[(i-1+n)%n]) errs.push(`predecessor of ${nd.id}`);
+      for(let j=0;j<this.m;j++) if(nd.finger[j]!==truth(nd.start[j])){ errs.push(`finger[${j}] of ${nd.id}`); break; }
+      if(checkKeys) for(const k of nd.keys.keys()) if(truth(k)!==nd) errs.push(`key ${k} misplaced on ${nd.id}`);
+    });
+    return {ok:!errs.length,errs};
+  }
+  stabilizeUntilConsistent(max=60){
+    for(let rnd=1;rnd<=max;rnd++){
+      for(const nd of shuffle([...this.nodes.values()])) nd.round(rnd>4);
+      if(this.verify(false).ok){ const moved=this.redistribute(); return {ok:true,rounds:rnd,moved}; }
+    }
+    return {ok:false,rounds:max,moved:0};
+  }
+  concurrent(joinNames,leavers){
+    const survivors=[...this.nodes.values()].filter(n=>!leavers.includes(n));
+    if(!survivors.length&&joinNames.length) throw new Error("no surviving entry peer");
+    const joiners=joinNames.map(nm=>this.newNode(nm));
+    const ops=shuffle([...joiners.map(j=>()=>j.joinConc(survivors[Math.floor(Math.random()*survivors.length)])),
+                       ...leavers.map(l=>()=>l.leaveConc())]);
+    ops.forEach(f=>f());                       // all started "at the same time", before any stabilization
+    for(const l of leavers) this.nodes.delete(l.id);
+    return this.stabilizeUntilConsistent();
+  }
+}
+
+function selfTest(){
+  const out=[]; const abc=sha1hex("abc");
+  if(abc!=="a9993e364706816aba3e25717850c26c9cd0d89d") throw new Error("SHA-1 broken: "+abc);
+  out.push("sha1 OK");
+  for(const m of [3,4,6,8,12,20]){
+    const ring=new Ring(m);
+    for(let step=0;step<80;step++){
+      const nodes=[...ring.nodes.values()];
+      if(Math.random()<0.55||nodes.length<2){ try{ ring.join(ring.freeName(),nodes[Math.floor(Math.random()*nodes.length)]); }catch(e){} }
+      else ring.leave(nodes[Math.floor(Math.random()*nodes.length)]);
+      if(Math.random()<0.4&&ring.nodes.size){ const ns=[...ring.nodes.values()]; ring.insert(ns[Math.floor(Math.random()*ns.length)],"k"+step,step); }
+      const v=ring.verify(); if(!v.ok) throw new Error(`sequential m=${m} step=${step}: ${v.errs.slice(0,3)}`);
+    }
+    out.push(`sequential m=${m} OK (${ring.nodes.size} peers)`);
+  }
+  for(const m of [5,8,12]){
+    for(let t=0;t<30;t++){
+      const ring=new Ring(m);
+      for(let i=0,n=4+Math.floor(Math.random()*9);i<n;i++){ try{ ring.join(ring.freeName(),[...ring.nodes.values()][0]); }catch(e){break;} }
+      for(let i=0;i<10;i++){ const ns=[...ring.nodes.values()]; ring.insert(ns[Math.floor(Math.random()*ns.length)],"d"+i,i); }
+      const names=[]; const pj=Math.floor(Math.random()*7);
+      for(let i=0;i<pj;i++){ try{ const nm=ring.freeName(); ring.nodes.set(ring.makeId(nm),null); names.push(nm); }catch(e){break;} }
+      for(const nm of names) ring.nodes.delete(ring.makeId(nm));
+      const all=shuffle([...ring.nodes.values()]); const pl=Math.floor(Math.random()*all.length);
+      const res=ring.concurrent(names,all.slice(0,pl));
+      const v=ring.verify(); const total=[...ring.nodes.values()].reduce((s,n)=>s+n.keys.size,0);
+      if(!res.ok||!v.ok||total!==10) throw new Error(`concurrent m=${m} trial=${t}: ${v.errs.slice(0,3)} keys=${total}`);
+    }
+    out.push(`concurrent m=${m} OK (30 trials)`);
+  }
+  return out;
+}
+// CORE-END
+
+// ------------------------------------------------------------------ UI
+const $=id=>document.getElementById(id);
+const ui={ ring:null, selected:null, path:[],
+  log(msg,cls=""){ const d=document.createElement("div"); if(cls) d.className=cls; d.textContent=msg; $("log").appendChild(d); $("log").scrollTop=1e9; },
+  need(){ if(!this.ring||!this.ring.nodes.size){ this.log("Create the ring first.","bad"); return false; } return true; },
+  guard(fn){ try{ fn(); }catch(e){ this.log("Error: "+e.message,"bad"); } },
+  resolve(v){ return this.ring.nodes.get(parseInt(v,10)); },
+  create(){ this.guard(()=>{
+    const m=parseInt($("m").value,10); if(!(m>=1&&m<=16)) throw new Error("m must be in 1..16");
+    this.ring=new Ring(m); this.path=[]; this.selected=null;
+    const names=$("init").value.trim().split(/\s+/).filter(Boolean);
+    for(const nm of names){ try{ this.ring.join(nm); }catch(e){ this.log(`'${nm}' ignored: ${e.message}`,"bad"); } }
+    this.log(`Ring created: m=${m} (2^${m}=${this.ring.M} slots), ${this.ring.nodes.size} peer(s).`,"ok");
+    this.check(); this.draw(); }); },
+  join(){ if(!this.need()) return; this.guard(()=>{
+    const name=$("jname").value.trim()||this.ring.freeName();
+    const n=this.ring.join(name,this.resolve($("jboot").value));
+    this.log(`Peer ${n.id} ('${n.name}') joined.`,"ok"); this.selected=n.id; this.path=[]; this.check(); this.draw(); $("jname").value=""; }); },
+  leave(){ if(!this.need()) return; this.guard(()=>{
+    const n=this.resolve($("lvnode").value); this.ring.leave(n);
+    this.log(`Peer ${n.id} ('${n.name}') left: keys handed to its successor, finger tables updated.`,"ok");
+    this.selected=null; this.path=[]; this.check(); this.draw(); }); },
+  lookup(){ if(!this.need()) return; this.guard(()=>{
+    const from=this.resolve($("lfrom").value), label=$("lkey").value.trim(); if(!label) return;
+    const kid=this.ring.keyId(label), trace=[], owner=from.findSucc(kid,trace);
+    this.log(`Lookup '${label}' (id ${kid}) from peer ${from.id}:`,"hot");
+    trace.forEach((t,i)=>this.log(`  ${i+1}. peer ${t.from.id}: key not in ]${t.from.id}, ${t.from.succ.id}] -> finger[${t.idx}] (start ${t.from.start[t.idx]}) -> peer ${t.to.id}`));
+    this.log(`  => key ${kid} is handled by peer ${owner.id} ('${owner.name}') after ${trace.length} hop(s)`+(owner.keys.has(kid)?`, value = ${owner.keys.get(kid).value}`:""),"ok");
+    this.path=[from,...trace.map(t=>t.to),owner]; this.selected=from.id; this.draw(); }); },
+  insert(){ if(!this.need()) return; this.guard(()=>{
+    const ns=[...this.ring.nodes.values()], r=this.ring.insert(ns[Math.floor(Math.random()*ns.length)],$("ikey").value.trim(),$("ival").value);
+    this.log(`Key ${r.kid} stored on peer ${r.owner.id}.`,"ok"); this.draw(); }); },
+  concurrent(){ if(!this.need()) return; this.guard(()=>{
+    const pj=parseInt($("pj").value,10)||0, pl=parseInt($("pl").value,10)||0;
+    if(pl>=this.ring.nodes.size) throw new Error("at least one peer must remain");
+    const names=[]; for(let i=0;i<pj;i++){ const nm=this.ring.freeName(); this.ring.nodes.set(this.ring.makeId(nm),null); names.push(nm); }
+    for(const nm of names) this.ring.nodes.delete(this.ring.makeId(nm));
+    const leavers=shuffle([...this.ring.nodes.values()]).slice(0,pl);
+    this.log(`Concurrent: joins ${names.join(", ")||"-"} | leaves ${leavers.map(l=>l.id).join(", ")||"-"}`,"hot");
+    const r=this.ring.concurrent(names,leavers);
+    this.log(r.ok?`Consistent after ${r.rounds} stabilization round(s)`+(r.moved?`, ${r.moved} key(s) re-placed`:""):"Did not converge, run again.", r.ok?"ok":"bad");
+    this.path=[]; this.check(); this.draw(); }); },
+  verify(){ if(this.need()) this.check(true); },
+  check(show){ const v=this.ring.verify(); if(v.ok){ if(show!==undefined||true) this.log("Check: all successors, predecessors, finger tables and keys are correct.","ok"); }
+    else this.log("Check FAILED: "+v.errs.slice(0,4).join("; "),"bad"); },
+  select(id){ this.selected=id; this.draw(); },
+
+  draw(){
+    const r=this.ring; if(!r) return;
+    const nodes=r.sorted(), M=r.M, C=280, R=210;
+    const pos=(id,rad=R)=>{ const a=id/M*2*Math.PI-Math.PI/2; return [C+rad*Math.cos(a),C+rad*Math.sin(a)]; };
+    let s=`<circle cx="${C}" cy="${C}" r="${R}" fill="none" stroke="var(--line)" stroke-width="2"/>`;
+    if(M<=64) for(let i=0;i<M;i++){ const [x,y]=pos(i,R+14); s+=`<text x="${x}" y="${y}" font-size="9" fill="var(--muted)" text-anchor="middle" dominant-baseline="middle">${i}</text>`; }
+    const sel=r.nodes.get(this.selected);
+    if(sel){ const seen=new Set(); for(const f of sel.finger){ if(f===sel||seen.has(f.id)) continue; seen.add(f.id);
+      const [x1,y1]=pos(sel.id),[x2,y2]=pos(f.id); s+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--accent)" stroke-width="1.2" stroke-dasharray="4 3" opacity=".7"/>`; } }
+    for(let i=0;i+1<this.path.length;i++){ const a=this.path[i],b=this.path[i+1]; if(!a.alive||!b.alive||a===b) continue;
+      const [x1,y1]=pos(a.id),[x2,y2]=pos(b.id); s+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--hot)" stroke-width="3" marker-end="url(#ar)"/>`; }
+    for(const n of nodes) for(const [k,v] of n.keys){ const [x,y]=pos(k,R-34);
+      s+=`<rect x="${x-5}" y="${y-5}" width="10" height="10" fill="var(--ok)"><title>key ${k} '${v.label}' on peer ${n.id}</title></rect>`; }
+    for(const n of nodes){ const [x,y]=pos(n.id), on=n.id===this.selected;
+      s+=`<g class="node" onclick="ui.select(${n.id})"><circle cx="${x}" cy="${y}" r="15" fill="${on?"var(--accent)":"var(--card)"}" stroke="var(--accent)" stroke-width="2"/>`+
+         `<text x="${x}" y="${y}" font-size="11" font-weight="600" text-anchor="middle" dominant-baseline="middle" fill="${on?"#fff":"var(--fg)"}">${n.id}</text><title>${n.name}</title></g>`; }
+    $("svg").innerHTML=`<defs><marker id="ar" markerWidth="8" markerHeight="8" refX="14" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--hot)"/></marker></defs>`+s;
+
+    if(sel){
+      let t=`<p><b>Peer ${sel.id}</b> ('${sel.name}') &nbsp; predecessor = ${sel.pred?sel.pred.id:"-"} &nbsp; successor = ${sel.succ.id}<br>Keys: ${[...sel.keys].map(([k,v])=>`${k} [${v.label}]`).join(", ")||"none"}</p>`;
+      t+=`<table><tr><th>i</th><th>start = (n+2<sup>i</sup>) mod 2<sup>m</sup></th><th>interval</th><th>successor</th></tr>`;
+      for(let i=0;i<r.m;i++){ const nx=i+1<r.m?sel.start[i+1]:sel.id; t+=`<tr><td>${i}</td><td>${sel.start[i]}</td><td>[${sel.start[i]}, ${nx})</td><td>${sel.finger[i].id}</td></tr>`; }
+      $("ft").innerHTML=t+"</table>";
+    } else $("ft").textContent="Click a peer on the ring.";
+    let a=`<table><tr><th>id</th><th>name</th><th>pred</th><th>succ</th><th>keys</th></tr>`;
+    for(const n of nodes) a+=`<tr style="cursor:pointer" onclick="ui.select(${n.id})"><td>${n.id}</td><td>${n.name}</td><td>${n.pred?n.pred.id:"-"}</td><td>${n.succ.id}</td><td>${[...n.keys.keys()].join(", ")}</td></tr>`;
+    $("all").innerHTML=a+"</table>";
+    const opts=nodes.map(n=>`<option value="${n.id}">${n.id} (${n.name})</option>`).join("");
+    for(const id of ["jboot","lfrom","lvnode"]){ const el=$(id), v=el.value; el.innerHTML=opts; if(v) el.value=v; }
+  }
+};
+ui.create();
+</script>
+</body>
+</html>
